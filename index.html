@@ -31,9 +31,9 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
 <div id="panel"><div class="box">
   <div class="eyebrow">HRB 2026 · Producers</div>
   <h1>Schedules + Rehearsals</h1>
-  <div id="loading"><div class="spin"></div><p>Loading the latest schedule…</p></div>
+  <div id="loading"><div class="spin"></div><p id="status">Loading the latest schedule…</p></div>
   <div id="signin" hidden>
-    <p>Sign in with your Dropbox account to view the live schedule. You'll stay signed in on this device.</p>
+    <p>Sign in with the Dropbox account that has the HRB 2026 shared folder. You'll stay signed in on this device.</p>
     <button id="login" type="button">Sign in with Dropbox</button>
   </div>
   <div id="error" class="err" hidden></div>
@@ -41,24 +41,27 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
 </div></div>
 <iframe id="viewer" title="HRB 2026 schedule"></iframe>
 <div id="toast"></div>
+<script src="https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide.js"></script>
 <script>
 (function () {
   'use strict';
   // ---- configuration ---------------------------------------------------------------
   var APP_KEY = 'hrenzrbvo84zxc7';
-  // Where the file usually is in the signed-in user's Dropbox. If it's not there (a shared
-  // folder can land anywhere for other people), the page searches their Dropbox by name.
-  var FILE_PATH = '/HRB 2026 Viewer/HRB 2026 Schedules + Rehearsals (Live).html';
-  var FILE_NAME = FILE_PATH.split('/').pop();
+  // The producers spreadsheet, as named in the shared folder. Each person's copy of the shared
+  // folder can sit anywhere in their Dropbox, so the page finds it by name.
+  var XLSX_NAME = 'Schedules+Rehearsals2026_Producers.xlsx';
+  var PAGE = { title: 'Schedules + Rehearsals', eyebrow: 'HRB 2026 · Producers', source_label: 'Dropbox', host_label: 'this device' };
   var CHECK_EVERY_MS = 60 * 1000;
+  var KEEP_BATCHES = 40;
   // -------------------------------------------------------------------------------------
 
   var REDIRECT = location.origin + location.pathname;
-  var K = { tok: 'hrbv.token', ver: 'hrbv.verifier', html: 'hrbv.html', rev: 'hrbv.rev', path: 'hrbv.path' };
+  var K = { tok: 'hrbv.token', ver: 'hrbv.verifier', html: 'hrbv.html2', rev: 'hrbv.rev2', path: 'hrbv.xlsxpath',
+            model: 'hrbv.model', batches: 'hrbv.batches', changedAt: 'hrbv.changedAt' };
   var $ = function (id) { return document.getElementById(id); };
   var frame = $('viewer');
   var currentRev = null;
-  var filePath = get(K.path) || FILE_PATH;
+  var xlsxPath = get(K.path);
 
   function get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
   function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
@@ -71,9 +74,20 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     $('error').textContent = msg || '';
     $('retry').hidden = state !== 'error';
   }
+  function status(msg) { $('status').textContent = msg; }
   function toast(msg) {
     var t = $('toast'); t.textContent = msg; t.style.display = 'block';
     clearTimeout(toast.t); toast.t = setTimeout(function () { t.style.display = 'none'; }, 3500);
+  }
+  function localIso(d) {
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    var off = -d.getTimezoneOffset(), sign = off >= 0 ? '+' : '-'; off = Math.abs(off);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' +
+      pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + sign + pad(Math.floor(off / 60)) + ':' + pad(off % 60);
+  }
+  function tzName() {
+    try { return new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(new Date()).filter(function (p) { return p.type === 'timeZoneName'; })[0].value; }
+    catch (e) { return ''; }
   }
 
   // ---- PKCE sign-in ------------------------------------------------------------------
@@ -121,19 +135,20 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     return JSON.parse(get(K.tok)).access;
   }
   function signOut() {
-    del(K.tok); del(K.html); del(K.rev); del(K.path); filePath = FILE_PATH;
+    [K.tok, K.html, K.rev, K.path, K.model, K.batches, K.changedAt].forEach(del);
+    xlsxPath = null; currentRev = null;
     document.body.classList.remove('ready');
     frame.removeAttribute('srcdoc');
     show('signin');
   }
 
   // ---- Dropbox file access -------------------------------------------------------------
-  async function api(url, arg, asText) {
+  async function api(url, arg, binary) {
     var tok = await accessToken();
     if (!tok) { var e = new Error('signed out'); e.auth = true; throw e; }
     var headers = { Authorization: 'Bearer ' + tok };
     var opts = { method: 'POST', headers: headers };
-    if (asText) headers['Dropbox-API-Arg'] = JSON.stringify(arg);
+    if (binary) headers['Dropbox-API-Arg'] = JSON.stringify(arg);
     else { headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(arg); }
     var r = await fetch(url, opts);
     if (r.status === 401) { var a = new Error('Dropbox sign-in expired'); a.auth = true; throw a; }
@@ -142,8 +157,72 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
       if (txt.indexOf('not_found') >= 0) { var nf = new Error('not found'); nf.notFound = true; throw nf; }
       throw new Error('Dropbox error ' + r.status + ': ' + txt.slice(0, 160));
     }
-    return asText ? { text: await r.text(), meta: JSON.parse(r.headers.get('Dropbox-API-Result') || '{}') } : r.json();
+    if (!binary) return r.json();
+    return { bytes: new Uint8Array(await r.arrayBuffer()), meta: JSON.parse(r.headers.get('Dropbox-API-Result') || '{}') };
   }
+  // Find the spreadsheet in this person's Dropbox (their copy of the shared folder).
+  async function findXlsx() {
+    status('Looking for the schedule in your Dropbox…');
+    var r = await api('https://api.dropboxapi.com/2/files/search_v2', {
+      query: XLSX_NAME, options: { filename_only: true, file_extensions: ['xlsx'], max_results: 25 }
+    });
+    var hits = (r.matches || []).map(function (m) { return m.metadata && m.metadata.metadata; })
+      .filter(function (md) { return md && md['.tag'] === 'file' && md.name.toLowerCase() === XLSX_NAME.toLowerCase(); })
+      .sort(function (a, b) { return (b.server_modified || '').localeCompare(a.server_modified || ''); });
+    if (!hits.length) throw new Error('Couldn’t find “' + XLSX_NAME + '” in this Dropbox account. Sign in with the account that has the HRB 2026 shared folder (Sign out is at the bottom of the schedule), or check the folder has been added to your Dropbox.');
+    xlsxPath = hits[0].path_lower; set(K.path, xlsxPath);
+  }
+  async function metadata() {
+    if (!xlsxPath) await findXlsx();
+    try { return await api('https://api.dropboxapi.com/2/files/get_metadata', { path: xlsxPath }); }
+    catch (e) { if (!e.notFound) throw e; await findXlsx(); return api('https://api.dropboxapi.com/2/files/get_metadata', { path: xlsxPath }); }
+  }
+
+  // ---- building the viewer on this device ------------------------------------------------
+  var pyReady = null;
+  function python() {
+    if (!pyReady) pyReady = (async function () {
+      status('Preparing the viewer (first time takes a few seconds)…');
+      var py = await loadPyodide();
+      await py.loadPackage('micropip');
+      var base = new URL('py/', location.href).href;
+      await py.runPythonAsync('import micropip\nawait micropip.install(["' + base + 'et_xmlfile-2.0.0-py3-none-any.whl", "' + base + 'openpyxl-3.1.5-py2.py3-none-any.whl"])');
+      var src = await (await fetch(base + 'build_viewer.py', { cache: 'no-cache' })).text();
+      py.FS.writeFile('/home/pyodide/build_viewer.py', src);
+      py.runPython('import sys\nsys.path.insert(0, "/home/pyodide")\nimport build_viewer');
+      return py;
+    })();
+    return pyReady;
+  }
+  var GLUE = [
+    'import json, io, datetime as dt, build_viewer as bv',
+    'model = bv.load_model(io.BytesIO(bytes(xlsx_bytes.to_py())))',
+    'old = json.loads(old_model) if old_model else None',
+    'batches = json.loads(old_batches or "[]")',
+    'now = dt.datetime.fromisoformat(now_iso)',
+    'changes = bv.diff_models(old, model)',
+    'if changes: batches.insert(0, {"at": now_iso, "changes": changes})',
+    'batches = batches[:keep]',
+    'recent = [c for b in batches if now - dt.datetime.fromisoformat(b["at"]) <= dt.timedelta(hours=24) for c in b["changes"]]',
+    'meta = dict(json.loads(page_meta), checked_at=now_iso, changed_at=changed_iso, change_batches=batches, recent_changes=recent, error=None)',
+    'json.dumps({"html": bv.render(model, meta), "model": json.dumps(model), "batches": json.dumps(batches), "changes": len(changes)})'
+  ].join('\n');
+  async function build(bytes, meta) {
+    var py = await python();
+    status('Building the schedule…');
+    var g = py.globals;
+    g.set('xlsx_bytes', bytes);
+    g.set('old_model', get(K.model));
+    g.set('old_batches', get(K.batches));
+    g.set('now_iso', localIso(new Date()));
+    g.set('changed_iso', meta.server_modified ? localIso(new Date(meta.server_modified)) : localIso(new Date()));
+    g.set('page_meta', JSON.stringify(Object.assign({ tz: tzName(), dropbox_url: 'https://www.dropbox.com/home' + encodeURI((meta.path_display || '').replace(/\/[^/]*$/, '')) }, PAGE)));
+    g.set('keep', KEEP_BATCHES);
+    var out = JSON.parse(await py.runPythonAsync(GLUE));
+    set(K.model, out.model); set(K.batches, out.batches);
+    return out;
+  }
+
   function render(html, rev) {
     currentRev = rev;
     frame.srcdoc = html;
@@ -151,68 +230,46 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
   }
   frame.addEventListener('load', function () {
     var d = frame.contentDocument; if (!d || !d.body) return;
-    // Open outside links (Dropbox "Open original") in a new tab instead of inside the frame.
     Array.prototype.forEach.call(d.querySelectorAll('a[href^="http"]'), function (a) { a.target = '_blank'; a.rel = 'noopener'; });
     var foot = d.querySelector('footer');
     if (foot && !d.getElementById('hrbv-signout')) {
       var p = d.createElement('p');
-      p.innerHTML = 'Viewing via your Dropbox account. <a href="#" id="hrbv-signout">Sign out</a>';
+      p.innerHTML = 'Built on this device from the spreadsheet in your Dropbox. <a href="#" id="hrbv-signout">Sign out</a>';
       foot.appendChild(p);
       d.getElementById('hrbv-signout').addEventListener('click', function (ev) { ev.preventDefault(); signOut(); });
     }
   });
 
-  // Search the user's Dropbox (including folders shared with them) for the viewer file.
-  async function findFile() {
-    var r = await api('https://api.dropboxapi.com/2/files/search_v2', {
-      query: FILE_NAME, options: { filename_only: true, file_extensions: ['html'], max_results: 25 }
-    });
-    var hits = (r.matches || []).map(function (m) { return m.metadata && m.metadata.metadata; })
-      .filter(function (md) { return md && md['.tag'] === 'file' && md.name === FILE_NAME; })
-      .sort(function (a, b) { return (b.server_modified || '').localeCompare(a.server_modified || ''); });
-    if (!hits.length) throw new Error('Couldn\u2019t find \u201c' + FILE_NAME + '\u201d in this Dropbox account. Ask Tyler to share the \u201cHRB 2026 Viewer\u201d folder with you, accept it in Dropbox, then tap Try again.');
-    filePath = hits[0].path_lower; set(K.path, filePath);
-    return filePath;
-  }
-  async function download() {
+  var busy = false;
+  async function refresh(quiet) {
+    if (busy) return; busy = true;
     try {
-      return await api('https://content.dropboxapi.com/2/files/download', { path: filePath }, true);
-    } catch (e) {
-      if (!e.notFound) throw e;
-      await findFile();
-      return api('https://content.dropboxapi.com/2/files/download', { path: filePath }, true);
-    }
-  }
-
-  async function load(quiet) {
-    try {
-      var f = await download();
-      set(K.html, f.text); set(K.rev, f.meta.rev || '');
-      var changed = currentRev && f.meta.rev !== currentRev;
-      render(f.text, f.meta.rev);
-      if (changed) toast('Schedule updated');
+      var meta = await metadata();
+      if (meta.rev && meta.rev === get(K.rev) && get(K.html)) {
+        if (currentRev !== meta.rev) render(get(K.html), meta.rev);
+        return;
+      }
+      status('Downloading the latest spreadsheet…');
+      var f = await api('https://content.dropboxapi.com/2/files/download', { path: xlsxPath }, true);
+      var out = await build(f.bytes, Object.assign({}, meta, f.meta));
+      var wasShowing = !!currentRev;
+      set(K.html, out.html); set(K.rev, f.meta.rev || meta.rev || '');
+      render(out.html, f.meta.rev || meta.rev);
+      if (wasShowing) toast(out.changes ? 'Schedule updated · ' + out.changes + ' change' + (out.changes === 1 ? '' : 's') : 'Schedule updated');
     } catch (e) {
       if (e.auth) { signOut(); if (e.message !== 'signed out') show('signin', e.message + ' — please sign in again.'); return; }
       if (document.body.classList.contains('ready')) { if (!quiet) toast('Offline — showing the last copy'); return; }
       show('error', e.message || String(e));
-    }
-  }
-  async function check() {
-    if (document.hidden || !currentRev) return;
-    try {
-      var m = await api('https://api.dropboxapi.com/2/files/get_metadata', { path: filePath });
-      if (m.rev && m.rev !== currentRev) await load(true);
-    } catch (e) { if (e.auth) signOut(); else if (e.notFound) await load(true); }
+    } finally { busy = false; }
   }
 
   // ---- start -----------------------------------------------------------------------------
   $('login').addEventListener('click', function () { login().catch(function (e) { show('signin', e.message); }); });
-  $('retry').addEventListener('click', function () { show('loading'); load(); });
-  document.addEventListener('visibilitychange', function () { if (!document.hidden) check(); });
-  setInterval(check, CHECK_EVERY_MS);
+  $('retry').addEventListener('click', function () { show('loading'); status('Loading the latest schedule…'); refresh(); });
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) refresh(true); });
+  setInterval(function () { if (!document.hidden) refresh(true); }, CHECK_EVERY_MS);
 
   (async function start() {
-    if (APP_KEY.indexOf('__') === 0) { show('error', 'This page has no Dropbox app key configured yet.'); return; }
     var q = new URLSearchParams(location.search);
     try {
       if (q.get('error')) { history.replaceState(null, '', REDIRECT); show('signin', 'Dropbox sign-in was cancelled.'); return; }
@@ -220,9 +277,9 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     } catch (e) { show('signin', e.message); return; }
     if (!get(K.tok)) { show('signin'); return; }
     var cached = get(K.html);
-    if (cached) render(cached, get(K.rev));   // instant open, then refresh
+    if (cached) render(cached, get(K.rev));   // instant open, then check for a newer spreadsheet
     show('loading');
-    load(!!cached);
+    refresh(!!cached);
   })();
 })();
 </script>
