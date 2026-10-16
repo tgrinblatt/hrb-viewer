@@ -54,12 +54,15 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
   var EVENT_TZ = 'America/Los_Angeles';
   var PAGE = { title: 'Schedules + Rehearsals', eyebrow: 'HRB 2026 · Producers', source_label: 'Dropbox', host_label: 'this device', display_tz: EVENT_TZ };
   var CHECK_EVERY_MS = 60 * 1000;
+  // Bump whenever the page or py/build_viewer.py changes: devices then rebuild their saved copy
+  // once (no sign-in needed) instead of waiting for the next spreadsheet edit.
+  var BUILD_ID = '2026-10-16.pacific';
   var KEEP_BATCHES = 40;
   // -------------------------------------------------------------------------------------
 
   var REDIRECT = location.origin + location.pathname;
   var K = { tok: 'hrbv.token', ver: 'hrbv.verifier', html: 'hrbv.html2', rev: 'hrbv.rev2', path: 'hrbv.xlsxpath',
-            model: 'hrbv.model', batches: 'hrbv.batches', changedAt: 'hrbv.changedAt' };
+            model: 'hrbv.model', batches: 'hrbv.batches', changedAt: 'hrbv.changedAt', build: 'hrbv.build' };
   var $ = function (id) { return document.getElementById(id); };
   var frame = $('viewer');
   var currentRev = null;
@@ -253,15 +256,15 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     if (busy) return; busy = true;
     try {
       var meta = await metadata();
-      if (meta.rev && meta.rev === get(K.rev) && get(K.html)) {
+      if (meta.rev && meta.rev === get(K.rev) && get(K.html) && get(K.build) === BUILD_ID) {
         if (currentRev !== meta.rev) render(get(K.html), meta.rev);
         return;
       }
       status('Downloading the latest spreadsheet…');
       var f = await api('https://content.dropboxapi.com/2/files/download', { path: xlsxPath }, true);
       var out = await build(f.bytes, Object.assign({}, meta, f.meta));
-      var wasShowing = !!currentRev;
-      set(K.html, out.html); set(K.rev, f.meta.rev || meta.rev || '');
+      var wasShowing = !!currentRev && get(K.build) === BUILD_ID;
+      set(K.html, out.html); set(K.rev, f.meta.rev || meta.rev || ''); set(K.build, BUILD_ID);
       render(out.html, f.meta.rev || meta.rev);
       if (wasShowing) toast(out.changes ? 'Schedule updated · ' + out.changes + ' change' + (out.changes === 1 ? '' : 's') : 'Schedule updated');
     } catch (e) {
