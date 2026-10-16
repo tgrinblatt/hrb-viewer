@@ -50,7 +50,9 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
   // The producers spreadsheet, as named in the shared folder. Each person's copy of the shared
   // folder can sit anywhere in their Dropbox, so the page finds it by name.
   var XLSX_NAME = 'Schedules+Rehearsals2026_Producers.xlsx';
-  var PAGE = { title: 'Schedules + Rehearsals', eyebrow: 'HRB 2026 · Producers', source_label: 'Dropbox', host_label: 'this device' };
+  // The show is in Anaheim: all stamps and the "Now" highlight use Pacific time on every device.
+  var EVENT_TZ = 'America/Los_Angeles';
+  var PAGE = { title: 'Schedules + Rehearsals', eyebrow: 'HRB 2026 · Producers', source_label: 'Dropbox', host_label: 'this device', display_tz: EVENT_TZ };
   var CHECK_EVERY_MS = 60 * 1000;
   var KEEP_BATCHES = 40;
   // -------------------------------------------------------------------------------------
@@ -79,16 +81,22 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     var t = $('toast'); t.textContent = msg; t.style.display = 'block';
     clearTimeout(toast.t); toast.t = setTimeout(function () { t.style.display = 'none'; }, 3500);
   }
+  // ISO timestamp with the event zone's wall time and UTC offset, e.g. 2026-10-18T09:15:00-07:00.
+  function zoneParts(d) {
+    var p = {};
+    new Intl.DateTimeFormat('en-US', { timeZone: EVENT_TZ, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit',
+      hour: '2-digit', minute: '2-digit', second: '2-digit', timeZoneName: 'short' }).formatToParts(d).forEach(function (x) { p[x.type] = x.value; });
+    return p;
+  }
   function localIso(d) {
     var pad = function (n) { return (n < 10 ? '0' : '') + n; };
-    var off = -d.getTimezoneOffset(), sign = off >= 0 ? '+' : '-'; off = Math.abs(off);
-    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' +
-      pad(d.getMinutes()) + ':' + pad(d.getSeconds()) + sign + pad(Math.floor(off / 60)) + ':' + pad(off % 60);
+    var p = zoneParts(d);
+    var wall = Date.UTC(+p.year, p.month - 1, +p.day, +p.hour % 24, +p.minute, +p.second);
+    var off = Math.round((wall - Math.floor(d.getTime() / 1000) * 1000) / 60000), sign = off >= 0 ? '+' : '-'; off = Math.abs(off);
+    return p.year + '-' + p.month + '-' + p.day + 'T' + pad(+p.hour % 24) + ':' + p.minute + ':' + p.second +
+      sign + pad(Math.floor(off / 60)) + ':' + pad(off % 60);
   }
-  function tzName() {
-    try { return new Intl.DateTimeFormat('en-US', { timeZoneName: 'short' }).formatToParts(new Date()).filter(function (p) { return p.type === 'timeZoneName'; })[0].value; }
-    catch (e) { return ''; }
-  }
+  function tzName() { try { return zoneParts(new Date()).timeZoneName || ''; } catch (e) { return ''; } }
 
   // ---- PKCE sign-in ------------------------------------------------------------------
   function b64url(bytes) {

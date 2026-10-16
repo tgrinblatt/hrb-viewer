@@ -474,6 +474,17 @@ def diff_models(old: dict | None, new: dict) -> list[dict]:
 
 # --------------------------------------------------------------------------- rendering
 
+def to_zone(t: dt.datetime, tz_name: str | None) -> dt.datetime:
+    """Show a timestamp in the event's time zone (e.g. America/Los_Angeles), not the Mac's."""
+    if not tz_name or t.tzinfo is None:
+        return t
+    try:
+        from zoneinfo import ZoneInfo
+        return t.astimezone(ZoneInfo(tz_name))
+    except Exception:  # no tz database (e.g. in-browser build): timestamps already arrive in the event zone
+        return t
+
+
 def e(s) -> str:
     return html.escape(str(s or ""), quote=True)
 
@@ -532,6 +543,7 @@ class Page:
         self.radios: list[str] = []
         self.css: list[str] = []
         self.changed_keys = {c["key"] for c in meta.get("recent_changes", [])}
+        self.tz_name = meta.get("display_tz")
         self.forum_audiences: dict[str, list[str]] = {}
 
     def radio(self, name: str, rid: str, checked: bool = False) -> None:
@@ -806,7 +818,7 @@ class Page:
                     'what changed shows up here and the affected sessions get an <span class="upd">Updated</span> tag for 24 hours.</p></section>')
         p = ['<section class="chg">']
         for b in batches:
-            when = dt.datetime.fromisoformat(b["at"])
+            when = to_zone(dt.datetime.fromisoformat(b["at"]), self.tz_name)
             p.append(f'<h2 class="dayh"><span>{e(when.strftime("%a %b"))} {when.day}</span> {e(fmt_time(when.time()))} · {len(b["changes"])} change{"s" if len(b["changes"]) != 1 else ""}</h2><ul class="clist">')
             for c in b["changes"][:200]:
                 if c["type"] == "changed":
@@ -843,13 +855,14 @@ class Page:
         toolbars = "".join(f'<div class="tb tb-{vid}">{tb}</div>' for vid, _l, tb, _b in views if tb)
         bodies = "".join(f'<div class="view" id="{vid}-view">{body}</div>' for vid, _l, _t, body in views)
 
-        checked = dt.datetime.fromisoformat(meta["checked_at"])
-        changed = dt.datetime.fromisoformat(meta["changed_at"]) if meta.get("changed_at") else None
+        checked = to_zone(dt.datetime.fromisoformat(meta["checked_at"]), self.tz_name)
+        changed = to_zone(dt.datetime.fromisoformat(meta["changed_at"]), self.tz_name) if meta.get("changed_at") else None
         stamp = f"{checked.strftime('%a %b')} {checked.day}, {fmt_time(checked.time())}"
         err = meta.get("error")
         status = (f'<div class="alert">Couldn’t reach the Dropbox file since {e(meta.get("error_since_label", ""))}: {e(err)}. '
                   f'Showing the last good copy.</div>' if err else "")
-        tz = meta.get("tz", "")
+        zone_abbr = checked.tzname() or ""
+        tz = zone_abbr if zone_abbr.isalpha() else meta.get("tz", "")
         title = meta.get("title", "Schedules + Rehearsals")
         dropbox = meta.get("dropbox_url", "")
 
@@ -867,6 +880,7 @@ class Page:
             dropbox=e(dropbox),
             status=status,
             version=e(BUILD_VERSION),
+            display_tz=e(meta.get("display_tz") or ""),
             js=JS,
         )
         return re.sub(r"@@(\w+)@@", lambda m: values[m.group(1)], TEMPLATE)
@@ -909,7 +923,7 @@ TEMPLATE = """<!doctype html>
 <title>@@title@@</title>
 <style>@@css@@</style>
 </head>
-<body id="top">
+<body id="top" data-tz="@@display_tz@@">
 @@radios@@
 <div class="brand">
     <div class="eyebrow">@@eyebrow@@</div>
@@ -1111,7 +1125,18 @@ JS = r"""
   function pad(n){return (n<10?'0':'')+n}
   function isoDate(d){return d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())}
   function parse(s){if(!s)return null;var m=/^(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d)$/.exec(s);return m?new Date(+m[1],m[2]-1,+m[3],+m[4],+m[5]):null}
-  var state=load(), now=new Date(), today=isoDate(now);
+  // Session times in the sheet are the event's local times; compare them against the clock in
+  // the event's zone (data-tz) so "Now" and "today" are right on any device, wherever it is.
+  var TZ=document.body.getAttribute('data-tz')||'';
+  function wallNow(){
+    var d=new Date(); if(!TZ) return d;
+    try{
+      var p={}; new Intl.DateTimeFormat('en-US',{timeZone:TZ,hourCycle:'h23',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit'})
+        .formatToParts(d).forEach(function(x){p[x.type]=x.value});
+      return new Date(+p.year,p.month-1,+p.day,+p.hour%24,+p.minute,+p.second);
+    }catch(e){return d}
+  }
+  var state=load(), now=wallNow(), today=isoDate(now);
 
   // Restore remembered selections; on first visit during the event, jump to today.
   var radios=document.querySelectorAll('input.ctl');
@@ -1139,7 +1164,7 @@ JS = r"""
     if(!checked)return;
     var t=new Date(checked.getAttribute('data-iso')), mins=Math.round((Date.now()-t)/60000);
     var rel=mins<1?'just now':mins<60?mins+' min ago':mins<1440?Math.round(mins/60)+' h ago':Math.round(mins/1440)+' d ago';
-    checked.textContent=rel;checked.title=t.toLocaleString();
+    checked.textContent=rel;checked.title=t.toLocaleString(undefined,TZ?{timeZone:TZ,timeZoneName:'short'}:undefined);
     var stale=document.getElementById('stale');
     if(mins>120){stale.hidden=false;stale.textContent='This copy was last refreshed '+rel+'. The Mac mini may be offline, so tap "Open original" for the newest version.';}
     else stale.hidden=true;
@@ -1148,7 +1173,7 @@ JS = r"""
   // Happening now.
   var timed=document.querySelectorAll('[data-s][data-e]'), nowbtn=document.getElementById('nowbtn');
   function tick(){
-    var t=new Date(), any=false;
+    var t=wallNow(), any=false;
     Array.prototype.forEach.call(timed,function(el){
       var s=parse(el.getAttribute('data-s')), e=parse(el.getAttribute('data-e'));
       var on=!!(s&&e&&s<=t&&t<e);
