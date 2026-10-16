@@ -46,16 +46,19 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
   'use strict';
   // ---- configuration ---------------------------------------------------------------
   var APP_KEY = 'hrenzrbvo84zxc7';
-  // Path inside the signed-in user's Dropbox (relative to their own folder).
+  // Where the file usually is in the signed-in user's Dropbox. If it's not there (a shared
+  // folder can land anywhere for other people), the page searches their Dropbox by name.
   var FILE_PATH = '/HRB 2026 Viewer/HRB 2026 Schedules + Rehearsals (Live).html';
+  var FILE_NAME = FILE_PATH.split('/').pop();
   var CHECK_EVERY_MS = 60 * 1000;
   // -------------------------------------------------------------------------------------
 
   var REDIRECT = location.origin + location.pathname;
-  var K = { tok: 'hrbv.token', ver: 'hrbv.verifier', html: 'hrbv.html', rev: 'hrbv.rev' };
+  var K = { tok: 'hrbv.token', ver: 'hrbv.verifier', html: 'hrbv.html', rev: 'hrbv.rev', path: 'hrbv.path' };
   var $ = function (id) { return document.getElementById(id); };
   var frame = $('viewer');
   var currentRev = null;
+  var filePath = get(K.path) || FILE_PATH;
 
   function get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
   function set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
@@ -118,7 +121,7 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     return JSON.parse(get(K.tok)).access;
   }
   function signOut() {
-    del(K.tok); del(K.html); del(K.rev);
+    del(K.tok); del(K.html); del(K.rev); del(K.path); filePath = FILE_PATH;
     document.body.classList.remove('ready');
     frame.removeAttribute('srcdoc');
     show('signin');
@@ -136,7 +139,7 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     if (r.status === 401) { var a = new Error('Dropbox sign-in expired'); a.auth = true; throw a; }
     if (!r.ok) {
       var txt = await r.text();
-      if (txt.indexOf('not_found') >= 0) throw new Error('The schedule file isn’t in this Dropbox account (' + FILE_PATH + '). Make sure you signed in with the account the Mac mini syncs to.');
+      if (txt.indexOf('not_found') >= 0) { var nf = new Error('not found'); nf.notFound = true; throw nf; }
       throw new Error('Dropbox error ' + r.status + ': ' + txt.slice(0, 160));
     }
     return asText ? { text: await r.text(), meta: JSON.parse(r.headers.get('Dropbox-API-Result') || '{}') } : r.json();
@@ -159,9 +162,31 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
     }
   });
 
+  // Search the user's Dropbox (including folders shared with them) for the viewer file.
+  async function findFile() {
+    var r = await api('https://api.dropboxapi.com/2/files/search_v2', {
+      query: FILE_NAME, options: { filename_only: true, file_extensions: ['html'], max_results: 25 }
+    });
+    var hits = (r.matches || []).map(function (m) { return m.metadata && m.metadata.metadata; })
+      .filter(function (md) { return md && md['.tag'] === 'file' && md.name === FILE_NAME; })
+      .sort(function (a, b) { return (b.server_modified || '').localeCompare(a.server_modified || ''); });
+    if (!hits.length) throw new Error('Couldn\u2019t find \u201c' + FILE_NAME + '\u201d in this Dropbox account. Ask Tyler to share the \u201cHRB 2026 Viewer\u201d folder with you, accept it in Dropbox, then tap Try again.');
+    filePath = hits[0].path_lower; set(K.path, filePath);
+    return filePath;
+  }
+  async function download() {
+    try {
+      return await api('https://content.dropboxapi.com/2/files/download', { path: filePath }, true);
+    } catch (e) {
+      if (!e.notFound) throw e;
+      await findFile();
+      return api('https://content.dropboxapi.com/2/files/download', { path: filePath }, true);
+    }
+  }
+
   async function load(quiet) {
     try {
-      var f = await api('https://content.dropboxapi.com/2/files/download', { path: FILE_PATH }, true);
+      var f = await download();
       set(K.html, f.text); set(K.rev, f.meta.rev || '');
       var changed = currentRev && f.meta.rev !== currentRev;
       render(f.text, f.meta.rev);
@@ -175,9 +200,9 @@ button.secondary{background:transparent;color:var(--btn);margin-top:6px}
   async function check() {
     if (document.hidden || !currentRev) return;
     try {
-      var m = await api('https://api.dropboxapi.com/2/files/get_metadata', { path: FILE_PATH });
+      var m = await api('https://api.dropboxapi.com/2/files/get_metadata', { path: filePath });
       if (m.rev && m.rev !== currentRev) await load(true);
-    } catch (e) { if (e.auth) signOut(); }
+    } catch (e) { if (e.auth) signOut(); else if (e.notFound) await load(true); }
   }
 
   // ---- start -----------------------------------------------------------------------------
